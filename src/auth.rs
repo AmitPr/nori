@@ -1,51 +1,65 @@
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use axum::{extract::State, http::Response, Form};
-use axum_extra::extract::cookie::Cookie;
-use axum_extra::extract::PrivateCookieJar;
+use axum::extract::State;
+use axum::Json;
+
+use axum::http::{HeaderValue, StatusCode};
+use nori::json::{JsonBuilder, JsonResult};
 use rand::rngs::OsRng;
 use sea_orm::ActiveValue::NotSet;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use nori::entities::{session, user};
+use thiserror::Error;
+use tracing::warn;
 
 use crate::AppState;
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-pub struct UserInfoArgs {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Error)]
+pub enum AuthError {
+    #[error("Invalid username or password")]
+    InvalidCredentials,
+    #[error("Incorrect username or password")]
+    IncorrectCredentials,
+    #[error("User already exists")]
+    UserAlreadyExists,
+    #[error("Session not found")]
+    SessionNotFound,
+    #[error("Session expired")]
+    SessionExpired,
+    #[error("Internal server error")]
+    InternalServerError,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthRequest {
     pub username: String,
     pub password: String,
+    pub remember: Option<bool>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuthResponse {
+    pub session_id: String,
 }
 
 pub async fn register(
     State(state): State<AppState>,
-    jar: PrivateCookieJar,
-    user_data: Form<UserInfoArgs>,
-) -> (PrivateCookieJar, Response<String>) {
+    user_data: Json<AuthRequest>,
+) -> JsonResult<AuthResponse, AuthError> {
     let conn = state.db;
     let existing = user::Entity::find()
         .filter(user::Column::Username.eq(user_data.username.clone()))
         .all(&conn)
-        .await;
+        .await
+        .map(|data| data.is_empty());
     match existing {
-        Ok(users) if !users.is_empty() => (
-            jar,
-            Response::builder()
-                .status(400)
-                .header("Content-Type", "text/html")
-                .body("Username already exists".to_owned())
-                .unwrap(),
-        ),
-        Err(e) => (
-            jar,
-            Response::builder()
-                .status(500)
-                .header("Content-Type", "text/html")
-                .body(format!("Internal Server Error: {}", e))
-                .unwrap(),
-        ),
-        _ => {
+        Ok(false) => JsonBuilder::new(Err(AuthError::UserAlreadyExists))
+            .status(StatusCode::CONFLICT)
+            .build(),
+        Err(_) => Err(AuthError::InternalServerError).into(),
+        Ok(true) => {
+            //TODO: Validate username and password match requirements
             let salt = SaltString::generate(&mut OsRng);
             let argon2 = Argon2::default();
             let password_hash = argon2
@@ -61,12 +75,8 @@ pub async fn register(
 
             let insert_res = user::Entity::insert(u).exec(&conn).await;
             if insert_res.is_err() {
-                let res = Response::builder()
-                    .status(500)
-                    .header("Content-Type", "text/html")
-                    .body("Internal Server Error".to_owned())
-                    .unwrap();
-                return (jar, res);
+                warn!("Error inserting user: {:?}", insert_res);
+                return Err(AuthError::InternalServerError).into();
             }
             let inserted_user = insert_res.unwrap();
 
@@ -74,50 +84,25 @@ pub async fn register(
 
             let insert_session_res = session::Entity::insert(session).exec(&conn).await;
             if insert_session_res.is_err() {
-                println!("Error inserting session: {:?}", insert_session_res);
-                let res = Response::builder()
-                    .status(500)
-                    .header("Content-Type", "text/html")
-                    .body("Internal Server Error".to_owned())
-                    .unwrap();
-                return (jar, res);
+                warn!("Error creating session: {:?}", insert_session_res);
+                return Err(AuthError::InternalServerError).into();
             }
             let inserted_session = insert_session_res.unwrap();
-            let jar = jar.add(
-                Cookie::build("session_id", inserted_session.last_insert_id.to_string())
-                    .http_only(true)
-                    .secure(true)
-                    .finish(),
-            );
 
-            (
-                jar,
-                Response::builder()
-                    .status(200)
-                    .header("Content-Type", "text/html")
-                    .body("User created".to_owned())
-                    .unwrap(),
-            )
+            JsonBuilder::new(Ok(AuthResponse {
+                session_id: inserted_session.last_insert_id.to_string(),
+            }))
+            .status(StatusCode::CREATED)
+            .build()
         }
     }
 }
 
 pub async fn login(
     State(state): State<AppState>,
-    jar: PrivateCookieJar,
-    user_data: Form<UserInfoArgs>,
-) -> (PrivateCookieJar, Response<String>) {
+    user_data: Json<AuthRequest>,
+) -> JsonResult<AuthResponse, AuthError> {
     let conn = state.db;
-    if jar.get("session_id").is_some() {
-        return (
-            jar,
-            Response::builder()
-                .status(400)
-                .header("Content-Type", "text/html")
-                .body("Already logged in".to_owned())
-                .unwrap(),
-        );
-    }
     let existing = user::Entity::find()
         .filter(user::Column::Username.eq(user_data.username.clone()))
         .one(&conn)
@@ -134,56 +119,36 @@ pub async fn login(
 
                 let insert_session_res = session::Entity::insert(session).exec(&conn).await;
                 if insert_session_res.is_err() {
-                    println!("Error inserting session: {:?}", insert_session_res);
-                    let res = Response::builder()
-                        .status(500)
-                        .header("Content-Type", "text/html")
-                        .body("Internal Server Error".to_owned())
-                        .unwrap();
-                    return (jar, res);
+                    warn!("Error creating session: {:?}", insert_session_res);
+                    return Err(AuthError::InternalServerError).into();
                 }
                 let inserted_session = insert_session_res.unwrap();
-                let jar = jar.add(
-                    Cookie::build("session_id", inserted_session.last_insert_id.to_string())
-                        .http_only(true)
-                        .secure(true)
-                        .finish(),
-                );
-                
-                (
-                    jar,
-                    Response::builder()
-                        .status(200)
-                        .header("Content-Type", "text/html")
-                        .body("Login successful".to_owned())
-                        .unwrap(),
+                let header = HeaderValue::from_str(
+                    format!(
+                        "session={}; Secure; HttpOnly",
+                        inserted_session.last_insert_id
+                    )
+                    .as_str(),
                 )
+                .expect("could not create header");
+
+                JsonBuilder::new(Ok(AuthResponse {
+                    session_id: inserted_session.last_insert_id.to_string(),
+                }))
+                .header("Set-Cookie", header)
+                .build()
             } else {
-                (
-                    jar,
-                    Response::builder()
-                        .status(400)
-                        .header("Content-Type", "text/html")
-                        .body("Incorrect login".to_owned())
-                        .unwrap(),
-                )
+                JsonBuilder::new(Err(AuthError::IncorrectCredentials))
+                    .status(StatusCode::UNAUTHORIZED)
+                    .build()
             }
         }
-        Err(e) => (
-            jar,
-            Response::builder()
-                .status(500)
-                .header("Content-Type", "text/html")
-                .body(format!("Internal Server Error: {}", e))
-                .unwrap(),
-        ),
-        _ => (
-            jar,
-            Response::builder()
-                .status(400)
-                .header("Content-Type", "text/html")
-                .body("User does not exist".to_owned())
-                .unwrap(),
-        ),
+        Err(e) => {
+            warn!("Error finding user: {:?}", e);
+            Err(AuthError::InternalServerError).into()
+        }
+        _ => JsonBuilder::new(Err(AuthError::InvalidCredentials))
+            .status(StatusCode::UNAUTHORIZED)
+            .build(),
     }
 }
