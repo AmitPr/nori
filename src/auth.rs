@@ -3,7 +3,8 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::extract::State;
 use axum::Json;
 
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::StatusCode;
+use axum_extra::extract::CookieJar;
 use nori::json::{JsonBuilder, JsonResult};
 use rand::rngs::OsRng;
 use sea_orm::ActiveValue::NotSet;
@@ -44,6 +45,7 @@ pub struct AuthResponse {
 }
 
 pub async fn register(
+    jar: CookieJar,
     State(state): State<AppState>,
     user_data: Json<AuthRequest>,
 ) -> JsonResult<AuthResponse, AuthError> {
@@ -53,6 +55,7 @@ pub async fn register(
         .all(&conn)
         .await
         .map(|data| data.is_empty());
+    tracing::info!("jar: {:?}", jar);
     match existing {
         Ok(false) => JsonBuilder::new(Err(AuthError::UserAlreadyExists))
             .status(StatusCode::CONFLICT)
@@ -80,7 +83,17 @@ pub async fn register(
             }
             let inserted_user = insert_res.unwrap();
 
-            let session = session::ActiveModel::create_session(inserted_user.last_insert_id, None);
+            let expiry_time = if user_data.remember.unwrap_or(false) {
+                None
+            } else {
+                chrono::Utc::now()
+                    .checked_add_signed(chrono::Duration::seconds(10)) //TODO
+                    .map(|t| t.into())
+            };
+
+            let session =
+                session::ActiveModel::create_session(inserted_user.last_insert_id, expiry_time);
+            let header = session.get_cookie();
 
             let insert_session_res = session::Entity::insert(session).exec(&conn).await;
             if insert_session_res.is_err() {
@@ -93,6 +106,7 @@ pub async fn register(
                 session_id: inserted_session.last_insert_id.to_string(),
             }))
             .status(StatusCode::CREATED)
+            .header("Set-Cookie", header)
             .build()
         }
     }
@@ -115,7 +129,15 @@ pub async fn login(
                 .verify_password(user_data.password.as_bytes(), &parsed_hash)
                 .is_ok()
             {
-                let session = session::ActiveModel::create_session(user.id, None);
+                let expiry_time = if user_data.remember.unwrap_or(false) {
+                    None
+                } else {
+                    chrono::Utc::now()
+                        .checked_add_signed(chrono::Duration::seconds(10)) //TODO
+                        .map(|t| t.into())
+                };
+                let session = session::ActiveModel::create_session(user.id, expiry_time);
+                let header = session.get_cookie();
 
                 let insert_session_res = session::Entity::insert(session).exec(&conn).await;
                 if insert_session_res.is_err() {
@@ -123,14 +145,6 @@ pub async fn login(
                     return Err(AuthError::InternalServerError).into();
                 }
                 let inserted_session = insert_session_res.unwrap();
-                let header = HeaderValue::from_str(
-                    format!(
-                        "session={}; Secure; HttpOnly",
-                        inserted_session.last_insert_id
-                    )
-                    .as_str(),
-                )
-                .expect("could not create header");
 
                 JsonBuilder::new(Ok(AuthResponse {
                     session_id: inserted_session.last_insert_id.to_string(),

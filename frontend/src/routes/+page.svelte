@@ -46,7 +46,7 @@
             },
             body: JSON.stringify(request),
           });
-          console.log(res.body);
+          console.log(await res.json());
           loading = false;
         }
         break;

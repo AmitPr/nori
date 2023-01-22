@@ -1,3 +1,4 @@
+use axum::http::HeaderValue;
 use sea_orm::{entity::prelude::*, Set};
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
@@ -42,5 +43,29 @@ impl ActiveModel {
             user_id: Set(user_id),
             expires_at: Set(expires_at),
         }
+    }
+
+    pub fn get_cookie(&self) -> HeaderValue {
+        let header = HeaderValue::from_str(
+            format!(
+                "session={}; Secure; HttpOnly; SameSite=Strict; {}",
+                self.id.as_ref(),
+                if self.expires_at.as_ref().is_none() {
+                    "Expires=Thu, 31 Dec 2037 23:55:55 GMT;".to_string()
+                } else {
+                    format!(
+                        "Expires={};",
+                        self.expires_at
+                            .as_ref()
+                            .unwrap()
+                            .format("%a, %d %b %Y %T GMT")
+                            .to_string()
+                    )
+                }
+            )
+            .as_str(),
+        )
+        .expect("could not create header");
+        header
     }
 }
